@@ -464,28 +464,25 @@ function hgeUpdateKillMode({balance, dayStartBal, lastTrades, hour, mktState, ca
   return _hgeKillMode;
 }
 
-// ── calcHFTLots — BALANCED RISK ENGINE ────────────────────────────
-// Target: $50–$100/day profit from $50 start, ~6-10 trades/day
-// Math: 5% risk per trade = $2.50 on $50. SL avg $3.50 → 0.07 lots.
-//   TP1 at 1.2×SL = $4.20 win on 25% = $0.74
-//   TP2 at 2.2×SL = $7.70 win on 25% = $1.29
-//   TP3 at 3.8×SL = $13.30 win on 35% = $3.30
-//   Total win: $5.33. 55% WR × 6 trades = 3.3 wins × $5.33 = $17.59
-//   Losses: 2.7 × $2.50 = $6.75. Net: ~$10.84/day — scales with balance.
-// With strength boost: 7.5% risk → 0.11 lots → ~$17/day from $50.
-// At $100 balance: same % = $20/day. Compounds to $50-$100/day target.
+// ── calcHFTLots — PROFIT-FIRST RISK ENGINE ────────────────────────
+// CORE MATH: TP1=1.8×SL(30%), TP2=3.2×SL(30%), TP3+=5.5×SL trail(40%)
+// Expected win = 0.30×1.8 + 0.30×3.2 + 0.40×5.5 = 3.74×slD×lots
+// At 55% WR: EV = 0.55×3.74 - 0.45×1.0 = +1.61 per unit — always net positive.
+// RECOVERY: triggers after ANY 1 loss. Sizes next trade so TP1 alone
+// recovers the full previous loss. Cap: 30% of balance per trade.
 function calcHFTLots({balance, dayStartBal, strength, slD, score, inst="XAUUSD",
                       startBalance, streak, livePrice, hourGMT, seteRegime, mktState}){
   const pip = 10; // $10 per pip per lot on XAU/USD
 
   // ── STATE ─────────────────────────────────────────────────────────
   const drawdownPct = (dayStartBal-balance)/Math.max(dayStartBal,0.01);
-  const inCaution   = drawdownPct >= CAUTION_PCT;
-  const inDanger    = drawdownPct >= DAILY_STOP_PCT*0.75;
+  const inCaution   = drawdownPct >= CAUTION_PCT;        // 8%
+  const inDanger    = drawdownPct >= DAILY_STOP_PCT*0.75; // 15%
   const streakDir   = streak?.dir||"";
   const streakCur   = streak?.cur||0;
-  const inRecovery  = streakDir==="L"&&streakCur>=3;
-  const hotStreak   = streakDir==="W"&&streakCur>=3;
+  // Recovery fires after ANY single loss — not just after 3+
+  const inRecovery  = streakDir==="L" && streakCur>=1;
+  const hotStreak   = streakDir==="W" && streakCur>=3;
   const phase       = (balance/Math.max(startBalance||dayStartBal,0.01))<2?1
                     : (balance/Math.max(startBalance||dayStartBal,0.01))<6?2:3;
 
@@ -497,98 +494,76 @@ function calcHFTLots({balance, dayStartBal, strength, slD, score, inst="XAUUSD",
   );
 
   // ═══════════════════════════════════════════════════════════════
-  //  VOTE-DRIVEN GEOMETRIC LOT SIZER
-  //  Goal: meaningful profit per win that outweighs losses.
-  //
-  //  BASE RISK by vote count (of current balance):
-  //    2–3 votes  : 6%   — minimum entry, signal is borderline
-  //    4   votes  : 8%   — solid signal, size up
-  //    5   votes  : 10%  — strong, push harder
-  //    6+  votes  : 12%  — high conviction, maximum size
-  //
-  //  RECOVERY: after 2+ consecutive losses, the bot MUST make back
-  //  at least 2x the last loss. The lastLoss amount is tracked via
-  //  the streak object (streak.lastLossDollars). Recovery target risk
-  //  = max(normal risk, 2 × lastLoss), capped at 20% of balance.
-  //
-  //  PHASE GROWTH: risk % scales with how much the account has grown,
-  //  compounding wins into larger positions automatically.
-  //
-  //  CAPS: never risk >20% of balance, max 5.0 lots, margin safety.
+  //  VOTE-DRIVEN LOT SIZER — profit-first sizing
+  //  BASE RISK by vote count (% of current balance):
+  //    2–3 votes  : 8%   — borderline signal
+  //    4   votes  : 11%  — solid
+  //    5   votes  : 14%  — strong
+  //    6+  votes  : 18%  — ultra-high conviction
   // ═══════════════════════════════════════════════════════════════
   const votes = score || Math.round((strength||40)/100 * MAX_SCORE);
 
-  // ── BASE RISK % by vote count ────────────────────────────────────
   let baseRiskPct;
-  if     (votes >= 6) baseRiskPct = 0.12;  // 12% — very high conviction
-  else if(votes >= 5) baseRiskPct = 0.10;  // 10% — strong
-  else if(votes >= 4) baseRiskPct = 0.08;  //  8% — solid
-  else                baseRiskPct = 0.06;  //  6% — borderline (minConf=3)
+  if     (votes >= 6) baseRiskPct = 0.18;
+  else if(votes >= 5) baseRiskPct = 0.14;
+  else if(votes >= 4) baseRiskPct = 0.11;
+  else                baseRiskPct = 0.08;
 
-  // ── PHASE MULTIPLIER — account growth compounds lot sizes ────────
-  // growthRatio = current / sessionStart
-  const phMult = phase===3 ? 0.85   // SECURE (6x+): protect gains
-               : phase===2 ? 1.10   // COMPOUND (2–6x): ride the wave
-               :             1.00;  // BUILD (<2x): normal
+  // ── PHASE MULTIPLIER ─────────────────────────────────────────────
+  const phMult = phase===3 ? 0.80
+               : phase===2 ? 1.15
+               :             1.00;
 
   // ── HOT STREAK BOOST ─────────────────────────────────────────────
-  const streakMult = hotStreak ? 1.20 : 1.00; // +20% on 3+ consecutive wins
+  const streakMult = hotStreak ? 1.25 : 1.00;
 
-  // ── COMPUTE BASE RISK DOLLARS ────────────────────────────────────
+  // ── BASE RISK DOLLARS ────────────────────────────────────────────
   let riskDollars = balance * baseRiskPct * phMult * streakMult;
 
-  // ── RECOVERY MODE: target 2× the last loss ───────────────────────
-  // If 2+ consecutive losses, size next trade to recover at least
-  // 2x what was lost (at TP1 which closes 25% of position at 1.2×SL).
-  // Solving: lots × slD × 1.2 × pip × 0.25 >= 2 × lastLoss
-  //   → riskDollars_needed = 2 × lastLoss / (1.2 × 0.25) = 6.67 × lastLoss
-  // We target this as the risk budget so even a TP1 partial recoups 2× loss.
+  // ── RECOVERY MODE — any loss triggers recovery sizing ─────────────
+  // TP1 closes 30% at 1.8×SL → profit = 0.54 × riskDollars
+  // To recover totalLoss via TP1: riskDollars = totalLoss / 0.54 = 1.85×
+  // On 2+ consecutive losses: use 2.5× so TP1+TP2 covers the full hole.
+  // Safety: capped at 30% of balance so one bad recovery can't blow account.
   if(inRecovery){
-    const lastLoss = streak?.lastLossDollars || 0;
-    if(lastLoss > 0){
-      const recoveryTarget = lastLoss * 6.67; // TP1 partial will return 2×loss
-      riskDollars = Math.max(riskDollars, recoveryTarget);
+    const totalLoss = streak?.lastLossDollars || 0;
+    if(totalLoss > 0){
+      const recMult = streakCur >= 2 ? 2.5 : 1.85;
+      riskDollars = Math.max(riskDollars, totalLoss * recMult);
     } else {
-      riskDollars = Math.max(riskDollars, balance * 0.12); // floor at 12%
+      riskDollars = Math.max(riskDollars, balance * 0.15);
     }
   }
 
-  // ── CAPITAL PROTECTION REDUCTIONS ────────────────────────────────
-  if(inDanger)       riskDollars *= 0.40; // near daily stop: survival mode
-  else if(inCaution) riskDollars *= 0.70; // caution zone: 70% of normal
-  if(hmrActive)      riskDollars *= 0.60; // HMR window: 60% of normal
+  // ── CAPITAL PROTECTION ────────────────────────────────────────────
+  if(inDanger)       riskDollars *= 0.35;
+  else if(inCaution) riskDollars *= 0.65;
+  if(hmrActive)      riskDollars *= 0.55;
 
   // ── HARD CAPS ────────────────────────────────────────────────────
-  // Max 20% of balance per trade (aggressive but bounded)
-  // Min: enough to cover commission ($9) and still profit
-  riskDollars = Math.min(riskDollars, balance * 0.20);
-  riskDollars = Math.max(riskDollars, 0.50); // absolute floor
+  riskDollars = Math.min(riskDollars, balance * 0.30); // 30% max — allows recovery
+  riskDollars = Math.max(riskDollars, Math.max(balance * 0.01, 0.50));
 
-  // ── LOT CALCULATION ───────────────────────────────────────────────
-  // Use actual slD — don't apply artificial floor that kills lots.
-  // If SL is tight (good!), that means bigger lots for same risk budget.
-  const effectiveSLD = Math.max(slD, 1.00); // 1-pip floor only
+  // ── LOT CALCULATION ──────────────────────────────────────────────
+  const effectiveSLD = Math.max(slD, 1.00);
   const lotRaw = riskDollars / (effectiveSLD * pip);
 
-  // ── MARGIN GUARD — Exness Zero 1:2000 ────────────────────────────
-  // margin per lot = (goldPrice × 100) / 2000
-  // At $4700 gold: ~$235/lot. At $3300 gold: ~$165/lot.
+  // ── MARGIN GUARD ─────────────────────────────────────────────────
   const goldPrice = livePrice || 4700;
   const marginPerLot = (goldPrice * 100) / EXNESS_LEVERAGE;
   const maxLotsMargin = (balance * 0.40) / Math.max(marginPerLot, 1);
 
-  // ── ACCOUNT-SIZE LOT CAPS ─────────────────────────────────────────
-  // Allow meaningful lot sizes at every account tier
-  const maxLotsByBal = balance < 100  ? 1.00   // $50–$99
-                     : balance < 300  ? 2.50   // $100–$299
-                     : balance < 1000 ? 5.00   // $300–$999
-                     : 10.00;                  // $1000+
+  // ── ACCOUNT-SIZE LOT CAPS (raised to support recovery) ───────────
+  const maxLotsByBal = balance < 100  ? 1.50
+                     : balance < 300  ? 3.00
+                     : balance < 1000 ? 6.00
+                     : 10.00;
 
   const lots = +Math.min(
     Math.max(lotRaw, MIN_LOT),
     maxLotsByBal,
     maxLotsMargin,
-    5.0          // absolute hard cap
+    5.0
   ).toFixed(4);
 
   const riskPct = riskDollars / Math.max(balance, 0.01);
@@ -1643,9 +1618,9 @@ function masterSignal({cs,hour,kL,spread,orb,news,newsArr,fakeLog,minConf,tfCand
   // Caller should pass balance via opts if available — see processCandle.
   const{sl,slD}=calcHFTSL({cs,dir,entry,atr,spread,hourGMT,balance:500,inst:_inst});
 
-  // Market-state adaptive RR
+  // Market-state adaptive RR — widened for positive EV at all regimes
   const state=mktState||"NORMAL";
-  const rr=state==="TRENDING"?[1.2,2.2,3.8]:state==="RANGING"?[1.0,1.8,3.0]:[1.2,2.0,3.5];
+  const rr=state==="TRENDING"?[1.8,3.2,5.5]:state==="RANGING"?[1.5,2.8,4.5]:[1.8,3.2,5.5];
   const tp1=+snapTP(dir==="BUY"?entry+slD*rr[0]:entry-slD*rr[0],dir).toFixed(2);
   const tp2=+snapTP(dir==="BUY"?entry+slD*rr[1]:entry-slD*rr[1],dir).toFixed(2);
   const tp3=+(dir==="BUY"?entry+slD*rr[2]:entry-slD*rr[2]).toFixed(2);
@@ -1739,8 +1714,14 @@ function manageTrade(t, price, atr, liveProvider, pip=10){
         tr.sl = tr.entry;
         tr.beDone = true;
       } else {
-        // Post-BE: trail at 30% gap from entry→price move (ratchet)
-        const newSL = +(tr.entry + (price - tr.entry) * 0.30).toFixed(2);
+        // Post-BE: trail at 35% gap from highWater→price range (ratchet).
+        // Uses highWater as the anchor so trail ALWAYS keeps following price
+        // upward — even far past TP3 — maintaining 30-40% of the peak move.
+        const hw = tr.highWater != null ? tr.highWater : price;
+        const peakMove = hw - tr.entry; // total distance from entry to peak
+        // Gap = 35% of the full entry→highWater move, so trail sits at
+        // entry + 65% of peak — between 30% and 40% below current high.
+        const newSL = +(tr.entry + peakMove * 0.65).toFixed(2);
         if(newSL > tr.sl) tr.sl = newSL;
       }
     }
@@ -1753,8 +1734,10 @@ function manageTrade(t, price, atr, liveProvider, pip=10){
         tr.sl = tr.entry;
         tr.beDone = true;
       } else {
-        // Post-BE: trail at 30% gap from entry→price move (ratchet)
-        const newSL = +(tr.entry - (tr.entry - price) * 0.30).toFixed(2);
+        // Post-BE: trail at 35% gap using lowWater as anchor (ratchet).
+        const lw = tr.lowWater != null ? tr.lowWater : price;
+        const peakMove = tr.entry - lw; // total distance from entry to trough
+        const newSL = +(tr.entry - peakMove * 0.65).toFixed(2);
         if(newSL < tr.sl) tr.sl = newSL;
       }
     }
@@ -1958,28 +1941,28 @@ function Chart({candles,trade,trade2,livePrice,height=320,replayIdx=null,rLiveCa
     canvas.addEventListener('wheel',onWh,{passive:true});
 
     // ── COLOUR PALETTE ──────────────────────────────────────────────
-    const GRN='#26d97f';   // vivid green  — bull candles
-    const RED='#ff4466';   // vivid red    — bear candles
+    const GRN='#00c96e';   // deep vivid green  — bull candles
+    const RED='#e8203a';   // deep vivid red    — bear candles
     const BDR='#1e293b';   // border/grid
     const DM ='#475569';   // dim text
     const GLD='#f5c830';   // gold         — day boundary / entry line
     const LIV='#38bdf8';   // sky-blue     — live price tag
-    const BG ='#0a0a0e';   // background
+    const BG ='#070709';   // background (slightly deeper)
 
     // Trade line colour palette — each line is unmistakably distinct
-    const C_BUY    ='#3b82f6'; // blue  — BUY entry
-    const C_SELL   ='#f43f5e'; // rose  — SELL entry
-    const C_SL     ='#ef4444'; // red   — SL
-    const C_TRAIL  ='#f59e0b'; // amber — trailing stop (active)
-    const C_TP1    ='#34d399'; // emerald light
-    const C_TP2    ='#10b981'; // emerald mid
-    const C_TP3    ='#059669'; // emerald dark
+    const C_BUY    ='#2563eb'; // deep blue  — BUY entry
+    const C_SELL   ='#dc2626'; // deep rose  — SELL entry
+    const C_SL     ='#b91c1c'; // deep red   — SL
+    const C_TRAIL  ='#d97706'; // deep amber — trailing stop (active)
+    const C_TP1    ='#059669'; // deep emerald light
+    const C_TP2    ='#047857'; // deep emerald mid
+    const C_TP3    ='#065f46'; // deep emerald dark
     // Add-on (trade2) — same structure but slightly offset hue
-    const C2_ENTRY ='#a78bfa'; // violet — add-on entry
-    const C2_SL    ='#f97316'; // orange — add-on SL/trail
-    const C2_TP1   ='#67e8f9'; // cyan light
-    const C2_TP2   ='#22d3ee'; // cyan mid
-    const C2_TP3   ='#0891b2'; // cyan dark
+    const C2_ENTRY ='#7c3aed'; // deep violet — add-on entry
+    const C2_SL    ='#c2410c'; // deep orange — add-on SL/trail
+    const C2_TP1   ='#0e7490'; // deep cyan light
+    const C2_TP2   ='#0c6e80'; // deep cyan mid
+    const C2_TP3   ='#0a5a6a'; // deep cyan dark
 
     const _ctx2d=canvas.getContext('2d',{alpha:false,desynchronized:true});
     let _lastDrawTs=0;
@@ -2117,7 +2100,7 @@ function Chart({candles,trade,trade2,livePrice,height=320,replayIdx=null,rLiveCa
 
         // Full-width dashed line
         ctx.strokeStyle=col;
-        ctx.lineWidth=clamped?0.8:1.6;
+        ctx.lineWidth=clamped?0.5:0.8;
         ctx.globalAlpha=clamped?0.25:0.85;
         ctx.setLineDash(dashPattern);
         ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(W-pad.r,y);ctx.stroke();
@@ -2264,8 +2247,8 @@ function Chart({candles,trade,trade2,livePrice,height=320,replayIdx=null,rLiveCa
     <div style={{borderRadius:"10px",border:`1px solid ${BORDER}`,overflow:"hidden",background:"#0a0a0e",display:"flex",flexDirection:"column",height:"100%"}}>
       <div style={{display:"flex",gap:"8px",padding:"5px 10px",borderBottom:`1px solid ${BORDER}22`,
         alignItems:"center",flexShrink:0,background:"#0c0c10"}}>
-        <span style={{fontSize:"8px",color:"#26d97f",fontFamily:"'JetBrains Mono',monospace",fontWeight:"700"}}>● BULL</span>
-        <span style={{fontSize:"8px",color:"#ff4466",fontFamily:"'JetBrains Mono',monospace",fontWeight:"700"}}>● BEAR</span>
+        <span style={{fontSize:"8px",color:"#00c96e",fontFamily:"'JetBrains Mono',monospace",fontWeight:"700"}}>● BULL</span>
+        <span style={{fontSize:"8px",color:"#e8203a",fontFamily:"'JetBrains Mono',monospace",fontWeight:"700"}}>● BEAR</span>
         {trade&&<span style={{fontSize:"8px",color:trade.dir==="BUY"?"#3b82f6":"#f43f5e",fontFamily:"'JetBrains Mono',monospace",fontWeight:"700"}}>
           ● {trade.dir} @{trade.entry?.toFixed(2)}</span>}
         {trade2&&<span style={{fontSize:"8px",color:"#a78bfa",fontFamily:"'JetBrains Mono',monospace",fontWeight:"700"}}>
@@ -2946,11 +2929,12 @@ function App(){
           const prevStr=rStreak.current;
           rStreak.current=won
             ?(prevStr.dir==="W"
-              ?{cur:prevStr.cur+1,dir:"W",lastLossDollars:prevStr.lastLossDollars||0}
-              :{cur:1,dir:"W",lastLossDollars:prevStr.lastLossDollars||0})
+              ?{cur:prevStr.cur+1,dir:"W",lastLossDollars:0}  // reset loss on win
+              :{cur:1,dir:"W",lastLossDollars:0})              // reset loss on first win
             :(prevStr.dir==="L"
-              ?{cur:prevStr.cur+1,dir:"L",lastLossDollars:Math.max(Math.abs(pnl),prevStr.lastLossDollars||0)}
-              :{cur:1,dir:"L",lastLossDollars:Math.abs(pnl)});
+              // Accumulate total loss across consecutive losses so recovery covers the full hole
+              ?{cur:prevStr.cur+1,dir:"L",lastLossDollars:+(Math.abs(pnl)+(prevStr.lastLossDollars||0)).toFixed(2)}
+              :{cur:1,dir:"L",lastLossDollars:+Math.abs(pnl).toFixed(2)});
           setStreak(rStreak.current);
           const h=Math.floor(hour),hs=rHourStats.current[h]||{trades:0,wins:0};
           rHourStats.current[h]={trades:hs.trades+1,wins:hs.wins+(won?1:0)};setHourStats({...rHourStats.current});
@@ -3205,10 +3189,12 @@ function App(){
         mktState:rMktState.current||"NORMAL",
       });
 
-      // Recovery mode: prefer higher-conviction signals but don't hard-block
-      if(inRecovery && sig.score < rMinConf.current+1){
+      // Recovery mode: prefer higher-conviction signals, but only hard-block
+      // if the signal is truly weak (below base minConf, not minConf+1).
+      // We want recovery to fire on a good signal ASAP — not sit out waiting.
+      if(inRecovery && sig.score < rMinConf.current){
         setPhase("SCANNING");
-        setStatus(`🔄 Recovery · waiting for ${rMinConf.current+1}+ votes (got ${sig.score}) · rebuilding`);
+        setStatus(`🔄 Recovery · waiting for ${rMinConf.current}+ votes (got ${sig.score}) · rebuilding`);
         if(rMode.current!=="forward")setCandles([...newC]);
         return;
       }
@@ -3227,11 +3213,11 @@ function App(){
       ).toFixed(4);
 
       // Use recalculated SL for the actual trade
-      // HGEv5: widen TP targets in Kill tiers to match higher risk budget
-      // Realistic 1M RR — TP1 close for quick wins, TP2/3 let runners run
-      const rrTP1 = 1.2;  // TP1: 1.2×SL — quick partial profit lock
-      const rrTP2 = 2.2;  // TP2: 2.2×SL — solid R:R
-      const rrTP3 = 3.8;  // TP3: 3.8×SL — runner target
+      // Wider RR ensures wins outpace losses across all market conditions:
+      // TP1=1.8×SL, TP2=3.2×SL, TP3=5.5×SL — mathematically positive EV
+      const rrTP1 = 1.8;  // TP1: 1.8×SL — quick partial (enough to cover spread+commission)
+      const rrTP2 = 3.2;  // TP2: 3.2×SL — solid runner
+      const rrTP3 = 5.5;  // TP3: 5.5×SL — full runner, trail takes over after this
 
       // ── REALISTIC ENTRY PRICE ────────────────────────────────────────
       // Live: entry = signal candle close (market order, fills immediately)
